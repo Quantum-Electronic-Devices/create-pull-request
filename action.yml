@@ -2,7 +2,10 @@ name: "Create pull request"
 description: >
   Commits the modifications of already tracked files in the working tree to a
   new branch, pushes it and opens a pull request. Idempotent: if a pull request
-  (open, merged or declined) already exists for the branch, nothing happens.
+  for the branch is open, merged, or was opened by this account and then declined
+  by somebody else, nothing happens. A pull request that was opened by a
+  different account, or that this account closed itself (to replace it), does
+  not count, so a new one is opened.
   The calling job must check out the repository (preferably with
   `persist-credentials: false`), make its changes to tracked files, and grant
   `contents: write` and `pull-requests: write`.
@@ -17,7 +20,8 @@ inputs:
     description: >
       Name of the branch to create. Use a name that is unique per change (for
       example one that contains the new version), because an existing pull
-      request for the branch makes the action do nothing.
+      request for the branch makes the action do nothing (see the description
+      of the action for which pull requests count).
 
   title:
     required: true
@@ -50,7 +54,10 @@ inputs:
     default: "github-actions[bot]"
     description: >
       Login of the account the commit is attributed to, e.g. the login of a
-      bot account (or `<app-slug>[bot]` for a GitHub App).
+      bot account (or `<app-slug>[bot]` for a GitHub App). It should be the
+      account `github-token` belongs to: when the token's own login cannot be
+      determined (GITHUB_TOKEN, GitHub App tokens), it is used to recognise
+      pull requests opened or closed by this action.
 
   commit-user-id:
     required: false
@@ -139,17 +146,47 @@ runs:
         export GIT_CONFIG_KEY_1="credential.${SERVER_URL}.helper"
         export GIT_CONFIG_VALUE_1='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
 
-        # Idempotent: an open, merged or declined pull request for this exact
-        # branch means there is nothing to do (a schedule may run every day).
-        if [[ "$(gh pr list --head "${branch}" --state all --json number --jq length)" != "0" ]]; then
-          echo "A pull request for ${branch} already exists, nothing to do"
-          exit 0
-        fi
+        # Login of the account that authors the pull request: the owner of the
+        # token if it can be determined (personal access tokens), otherwise the
+        # configured commit user (GITHUB_TOKEN, GitHub App tokens).
+        me="$(gh api user --jq '.login' 2>/dev/null || true)"
+        [[ -n "${me}" ]] || me="${COMMIT_USER_NAME}"
 
-        # Reaching this point means no pull request exists for the branch, in any
-        # state. If the branch itself exists it is a leftover of an earlier,
-        # half-finished run and may be based on an old commit, so it is rebuilt
-        # from the current checkout and replaced. ls-remote also fails loudly on
+        # Idempotent (a schedule may run every day): a pull request for this exact
+        # branch means there is nothing to do if it is
+        #  - open or merged, or
+        #  - opened by this account and closed by somebody else (declined).
+        # It does not count if it was opened by a different account, or if this
+        # account closed it itself (a replacement, e.g. by a forced run), so a
+        # new one is opened then.
+        # Assigned separately so that an API failure stops the run.
+        existing="$(gh api -X GET "repos/${GH_REPO}/pulls" \
+                      -f state=all -f per_page=100 -f head="${GH_REPO%%/*}:${branch}" \
+                      --jq '.[] | [.number, .state, (if .merged_at then "merged" else "unmerged" end), .user.login] | @tsv')"
+        # (No empty field in the output: read would merge adjacent tabs.)
+        while IFS=$'\t' read -r pr_number pr_state pr_merged pr_author; do
+          [[ -n "${pr_state}" ]] || continue
+          blocks=0
+          # GitHub logins are case-insensitive.
+          if [[ "${pr_state}" == "open" || "${pr_merged}" == "merged" ]]; then
+            blocks=1
+          elif [[ "${pr_author,,}" == "${me,,}" ]]; then
+            # Closed without merging and opened by this account: it only blocks
+            # if somebody else closed it. An unknown closer counts as somebody else.
+            closed_by="$(gh api "repos/${GH_REPO}/issues/${pr_number}" --jq '.closed_by.login // ""')"
+            [[ "${closed_by,,}" == "${me,,}" ]] || blocks=1
+          fi
+          if [[ ${blocks} -eq 1 ]]; then
+            echo "Pull request #${pr_number} for ${branch} already exists (${pr_state}, ${pr_merged}, opened by ${pr_author}), nothing to do"
+            exit 0
+          fi
+        done <<< "${existing}"
+
+        # Reaching this point means there is no pull request for the branch that
+        # blocks a new one. If the branch itself exists it is a leftover of an
+        # earlier run or the branch of a pull request declined by another account,
+        # and may be based on an old commit, so it is rebuilt from the current
+        # checkout and replaced. ls-remote also fails loudly on
         # an authentication problem instead of silently looking like "no branch".
         old_sha="$(git ls-remote --heads origin "refs/heads/${branch}" | cut -f1)"
 
